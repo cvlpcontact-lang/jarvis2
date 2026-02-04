@@ -1,0 +1,203 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Jarvis – Mode Voiture</title>
+  <style>
+    body{font-family:system-ui,Arial,sans-serif;margin:16px}
+    .card{border:1px solid #ddd;border-radius:12px;padding:14px;max-width:820px}
+    .row{display:flex;gap:10px;flex-wrap:wrap}
+    button{padding:10px 14px;border-radius:10px;border:1px solid #ccc;background:#fff;cursor:pointer}
+    button:disabled{opacity:.5;cursor:not-allowed}
+    textarea{width:100%;min-height:90px;padding:10px;border-radius:10px;border:1px solid #ccc}
+    .status{font-weight:700;margin:8px 0}
+    .muted{opacity:.7;font-size:13px}
+  </style>
+</head>
+
+<body>
+<h2>Jarvis vocal → n8n (mode voiture)</h2>
+
+<div class="card">
+  <div class="row">
+    <button id="btnMic">🎤 Démarrer</button>
+    <button id="btnStop" disabled>⏹ Stop</button>
+    <button id="btnSend">➡️ Envoyer</button>
+    <button id="btnSpeak" disabled>🔊 Relire</button>
+    <button id="btnClear">🧹 Effacer</button>
+  </div>
+
+  <p class="muted">
+    Réglé pour Bluetooth voiture : silence long avant envoi, micro verrouillé pendant la voix,
+    ré-écoute retardée pour éviter l’écho.
+  </p>
+
+  <div class="status" id="status">Statut : prêt</div>
+
+  <label>Texte reconnu :</label>
+  <textarea id="inputText"></textarea>
+
+  <label>Réponse :</label>
+  <textarea id="outputText" readonly></textarea>
+
+  <label>Debug :</label>
+  <textarea id="rawText" readonly></textarea>
+</div>
+
+<script>
+/* ================= CONFIG VOITURE ================= */
+const WEBHOOK_URL = "https://n8n.srv765349.hstgr.cloud/webhook/jarvis";
+
+// ⏱️ délai de silence AVANT envoi (plus long = moins d’envois parasites)
+const AUTO_SEND_SILENCE_MS = 1800;
+
+// ⏸️ délai APRÈS la voix avant de ré-écouter (évite de capter la fin du TTS)
+const RESTART_LISTEN_AFTER_TTS_MS = 2000;
+
+// seuil minimal de longueur pour déclencher un envoi
+const MIN_CHARS_TO_SEND = 8;
+
+// conversation continue activée
+const CONTINUOUS = true;
+/* ================================================= */
+
+const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+
+const btnMic = document.getElementById("btnMic");
+const btnStop = document.getElementById("btnStop");
+const btnSend = document.getElementById("btnSend");
+const btnSpeak = document.getElementById("btnSpeak");
+const btnClear = document.getElementById("btnClear");
+
+const inputText = document.getElementById("inputText");
+const outputText = document.getElementById("outputText");
+const rawText = document.getElementById("rawText");
+const statusEl = document.getElementById("status");
+
+let recognition=null, isListening=false, isSpeaking=false, isSending=false;
+let silenceTimer=null;
+
+function setStatus(t){ statusEl.textContent="Statut : "+t; }
+function clearSilence(){ if(silenceTimer){clearTimeout(silenceTimer);silenceTimer=null;} }
+function safeStop(){ try{recognition&&recognition.stop();}catch{} }
+
+function initSTT(){
+  if(!SpeechRecognition){ setStatus("STT non supporté"); btnMic.disabled=true; return; }
+  recognition=new SpeechRecognition();
+  recognition.lang="fr-FR";
+  recognition.interimResults=true;
+  recognition.continuous=false;
+
+  recognition.onstart=()=>{ isListening=true; setStatus("écoute..."); btnMic.disabled=true; btnStop.disabled=false; };
+
+  recognition.onresult=(e)=>{
+    let t="";
+    for(let i=e.resultIndex;i<e.results.length;i++){ t+=e.results[i][0].transcript; }
+    inputText.value=t.trim();
+    clearSilence();
+    silenceTimer=setTimeout(()=>stopAndMaybeSend(true), AUTO_SEND_SILENCE_MS);
+  };
+
+  recognition.onerror=(e)=>{
+    isListening=false; btnMic.disabled=false; btnStop.disabled=true; clearSilence();
+    setStatus("erreur micro");
+    if(CONTINUOUS && !isSpeaking) setTimeout(startListening,1200);
+  };
+
+  recognition.onend=()=>{
+    isListening=false; btnMic.disabled=false; btnStop.disabled=true; clearSilence();
+    if(CONTINUOUS && !isSpeaking && !isSending){
+      setTimeout(startListening,300);
+    } else {
+      setStatus(isSpeaking?"Jarvis parle...":"micro arrêté");
+    }
+  };
+}
+
+function startListening(){
+  if(isSpeaking||isSending||isListening) return;
+  clearSilence();
+  try{recognition.start();}catch{}
+}
+
+function stopAndMaybeSend(send){
+  clearSilence();
+  if(isListening) safeStop();
+  if(send){
+    const t=inputText.value.trim();
+    if(t.length>=MIN_CHARS_TO_SEND) sendToN8n();
+  }
+}
+
+/* ---------- TTS ---------- */
+function speak(text){
+  if(!text) return;
+  isSpeaking=true;
+  if(isListening) safeStop();
+
+  speechSynthesis.cancel();
+  const u=new SpeechSynthesisUtterance(text);
+  u.lang="fr-FR";
+
+  u.onend=()=>{
+    isSpeaking=false;
+    setStatus("prêt");
+    if(CONTINUOUS){
+      setTimeout(startListening, RESTART_LISTEN_AFTER_TTS_MS);
+    }
+  };
+  u.onerror=()=>{ isSpeaking=false; setStatus("erreur voix"); if(CONTINUOUS) setTimeout(startListening,2500); };
+
+  setStatus("Jarvis parle...");
+  speechSynthesis.speak(u);
+}
+
+/* ---------- Parsing ---------- */
+function extractOutput(o){
+  if(!o||typeof o!=="object") return null;
+  if(typeof o.output==="string") return o.output;
+  for(const k in o){ const r=extractOutput(o[k]); if(r) return r; }
+  return null;
+}
+
+/* ---------- Call n8n ---------- */
+async function sendToN8n(){
+  if(isSending) return;
+  const t=inputText.value.trim();
+  if(!t) return;
+
+  isSending=true;
+  setStatus("envoi...");
+  rawText.value=""; outputText.value=""; btnSpeak.disabled=true;
+  if(isListening) safeStop();
+
+  try{
+    const res=await fetch(WEBHOOK_URL,{
+      method:"POST", headers:{ "Content-Type":"application/json" },
+      body:JSON.stringify({ chatInput:t })
+    });
+    const raw=await res.text(); rawText.value=raw;
+    let ans=raw;
+    try{ const p=JSON.parse(raw); ans=extractOutput(p)||raw; }catch{}
+    outputText.value=ans; btnSpeak.disabled=!ans;
+    speak(ans);
+  }catch(e){
+    setStatus("erreur réseau");
+    if(CONTINUOUS) setTimeout(startListening,3000);
+  }finally{
+    isSending=false;
+  }
+}
+
+/* ---------- UI ---------- */
+btnMic.onclick=()=>startListening();
+btnStop.onclick=()=>{ stopAndMaybeSend(false); setStatus("arrêté"); };
+btnSend.onclick=()=>sendToN8n();
+btnSpeak.onclick=()=>speak(outputText.value);
+btnClear.onclick=()=>{ inputText.value=""; outputText.value=""; rawText.value=""; setStatus("prêt"); };
+
+initSTT();
+</script>
+</body>
+</html>
