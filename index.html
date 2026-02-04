@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Jarvis — Mode Voiture (v2 corrigé)</title>
+  <title>Jarvis — Mode Voiture (v3 fixé)</title>
   <style>
     body{
       font-family:system-ui,Arial,sans-serif;
@@ -89,7 +89,7 @@
 </head>
 
 <body>
-<h2>🚗 Jarvis vocal — Mode Voiture (v2)</h2>
+<h2>🚗 Jarvis vocal — Mode Voiture (v3)</h2>
 
 <div class="card">
   <div class="row">
@@ -101,8 +101,8 @@
   </div>
 
   <p class="muted">
-    <strong>Version corrigée :</strong> machine à états stricte, pas de boucle infinie, 
-    séparation claire écoute/traitement/réponse.
+    <strong>v3 corrigée :</strong> envoi automatique à la fin de la reconnaissance, 
+    gestion robuste des états, pas de boucle infinie.
   </p>
 
   <div class="status idle" id="status">État : IDLE</div>
@@ -113,7 +113,7 @@
   <label>💬 Réponse Jarvis :</label>
   <textarea id="outputText" readonly></textarea>
 
-  <label>🐞 Debug (JSON brut) :</label>
+  <label>🐞 Debug :</label>
   <textarea id="rawText" readonly class="debug-log"></textarea>
 </div>
 
@@ -122,14 +122,11 @@
 const CONFIG = {
   webhookUrl: "https://n8n.srv765349.hstgr.cloud/webhook/jarvis",
   
-  // Délai de silence avant envoi automatique (ms)
-  autoSendSilenceMs: 2000,
-  
-  // Délai APRÈS la fin de TTS avant de réécouter (sécurité anti-boucle)
-  restartAfterTtsMs: 2500,
-  
-  // Nombre minimum de caractères pour déclencher un envoi
+  // Nombre minimum de caractères pour envoyer
   minCharsToSend: 5,
+  
+  // Délai APRÈS la fin de TTS avant de réécouter
+  restartAfterTtsMs: 2500,
   
   // Mode conversation continue
   continuousMode: true,
@@ -140,10 +137,10 @@ const CONFIG = {
 
 /* ================= MACHINE À ÉTATS ================= */
 const STATE = {
-  IDLE: 'idle',           // Repos, rien en cours
-  LISTENING: 'listening', // Micro actif, écoute utilisateur
-  PROCESSING: 'processing', // Envoi + attente réponse
-  SPEAKING: 'speaking'    // Lecture TTS de la réponse
+  IDLE: 'idle',
+  LISTENING: 'listening',
+  PROCESSING: 'processing',
+  SPEAKING: 'speaking'
 };
 
 let currentState = STATE.IDLE;
@@ -163,45 +160,29 @@ const statusEl = $("status");
 /* ================= VARIABLES GLOBALES ================= */
 const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
 let recognition = null;
-let silenceTimer = null;
+let lastTranscript = ""; // Pour détecter si nouveau texte
 
 /* ================= GESTION DES ÉTATS ================= */
 function setState(newState) {
   currentState = newState;
   updateUI();
-  console.log(`[STATE] → ${newState.toUpperCase()}`);
+  addLog(`État → ${newState.toUpperCase()}`);
 }
 
 function updateUI() {
-  // Mise à jour visuelle du statut
   statusEl.className = `status ${currentState}`;
   statusEl.textContent = `État : ${currentState.toUpperCase()}`;
   
-  // Gestion des boutons
   btnMic.disabled = (currentState !== STATE.IDLE);
   btnStop.disabled = (currentState !== STATE.LISTENING);
   btnSend.disabled = (currentState === STATE.PROCESSING || currentState === STATE.SPEAKING);
-  
-  // Log visuel
-  if (currentState === STATE.IDLE) {
-    rawText.value += `\n[${new Date().toLocaleTimeString()}] Retour au repos`;
-  }
 }
 
-/* ================= GESTION DU TIMER DE SILENCE ================= */
-function clearSilenceTimer() {
-  if (silenceTimer) {
-    clearTimeout(silenceTimer);
-    silenceTimer = null;
-  }
-}
-
-function resetSilenceTimer() {
-  clearSilenceTimer();
-  silenceTimer = setTimeout(() => {
-    console.log("[SILENCE] Détecté → envoi automatique");
-    stopListeningAndSend();
-  }, CONFIG.autoSendSilenceMs);
+function addLog(message) {
+  const time = new Date().toLocaleTimeString('fr-FR');
+  rawText.value += `[${time}] ${message}\n`;
+  rawText.scrollTop = rawText.scrollHeight;
+  console.log(`[${time}] ${message}`);
 }
 
 /* ================= RECONNAISSANCE VOCALE ================= */
@@ -217,11 +198,12 @@ function initSpeechRecognition() {
   recognition = new SpeechRecognition();
   recognition.lang = CONFIG.lang;
   recognition.interimResults = true;
-  recognition.continuous = false; // Important: on gère manuellement le redémarrage
+  recognition.continuous = false;
 
   recognition.onstart = () => {
-    console.log("[STT] Démarré");
+    addLog("🎤 Micro démarré");
     setState(STATE.LISTENING);
+    lastTranscript = "";
   };
 
   recognition.onresult = (event) => {
@@ -230,27 +212,23 @@ function initSpeechRecognition() {
       transcript += event.results[i][0].transcript;
     }
     
-    inputText.value = transcript.trim();
+    const text = transcript.trim();
+    inputText.value = text;
+    lastTranscript = text;
     
-    // Réinitialiser le timer à chaque nouvelle parole détectée
-    if (currentState === STATE.LISTENING) {
-      resetSilenceTimer();
-    }
+    addLog(`📝 Texte: "${text.substring(0, 50)}${text.length > 50 ? '...' : ''}"`);
   };
 
   recognition.onerror = (event) => {
-    console.error("[STT] Erreur:", event.error);
-    clearSilenceTimer();
+    addLog(`❌ Erreur micro: ${event.error}`);
     
-    // Ne pas redémarrer en cas d'erreur réseau ou permission
     if (event.error === 'network' || event.error === 'not-allowed') {
       setState(STATE.IDLE);
-      statusEl.textContent = `❌ Erreur micro: ${event.error}`;
+      statusEl.textContent = `❌ Erreur: ${event.error}`;
       statusEl.className = "status error";
       return;
     }
     
-    // Pour les autres erreurs, retour IDLE et éventuellement redémarrer
     setState(STATE.IDLE);
     if (CONFIG.continuousMode) {
       setTimeout(startListening, 1500);
@@ -258,26 +236,26 @@ function initSpeechRecognition() {
   };
 
   recognition.onend = () => {
-    console.log("[STT] Arrêté");
-    clearSilenceTimer();
+    addLog("🛑 Reconnaissance arrêtée");
     
-    // ⚠️ CRUCIAL: Ne redémarrer QUE si on est en IDLE et en mode continu
-    // Cela évite de redémarrer pendant PROCESSING ou SPEAKING
-    if (currentState === STATE.LISTENING) {
+    // ✅ CORRECTIF PRINCIPAL: Si on a du texte, l'envoyer !
+    const text = inputText.value.trim();
+    
+    if (currentState === STATE.LISTENING && text.length >= CONFIG.minCharsToSend) {
+      addLog(`📤 Envoi automatique: "${text.substring(0, 30)}..."`);
+      sendToWebhook();
+    } else if (currentState === STATE.LISTENING) {
+      // Pas assez de texte, retour IDLE et redémarrage
+      addLog(`⚠️ Texte trop court (${text.length} chars), redémarrage...`);
       setState(STATE.IDLE);
-    }
-    
-    // Redémarrage automatique UNIQUEMENT si:
-    // 1. Mode continu activé
-    // 2. État actuel est IDLE
-    // 3. Pas en train de traiter ou parler
-    if (CONFIG.continuousMode && currentState === STATE.IDLE) {
-      console.log("[AUTO] Redémarrage écoute dans 500ms");
-      setTimeout(() => {
-        if (currentState === STATE.IDLE) { // Double vérification
-          startListening();
-        }
-      }, 500);
+      
+      if (CONFIG.continuousMode) {
+        setTimeout(() => {
+          if (currentState === STATE.IDLE) {
+            startListening();
+          }
+        }, 500);
+      }
     }
   };
 
@@ -286,56 +264,30 @@ function initSpeechRecognition() {
 
 /* ================= CONTRÔLE DE L'ÉCOUTE ================= */
 function startListening() {
-  // Bloquer si pas en IDLE
   if (currentState !== STATE.IDLE) {
-    console.log("[STT] Impossible de démarrer, état:", currentState);
+    addLog(`⚠️ Impossible de démarrer (état: ${currentState})`);
     return;
   }
   
-  clearSilenceTimer();
+  inputText.value = "";
+  lastTranscript = "";
   
   try {
     recognition.start();
   } catch (e) {
-    console.error("[STT] Erreur au démarrage:", e);
-    // L'API peut lever une erreur si déjà démarrée
-    setState(STATE.IDLE);
-  }
-}
-
-function stopListeningAndSend() {
-  clearSilenceTimer();
-  
-  // Arrêter proprement la reconnaissance
-  if (currentState === STATE.LISTENING) {
-    try {
-      recognition.stop(); // Cela déclenchera onend
-    } catch (e) {
-      console.error("[STT] Erreur à l'arrêt:", e);
-    }
-  }
-  
-  // Envoyer le texte
-  const text = inputText.value.trim();
-  if (text.length >= CONFIG.minCharsToSend) {
-    sendToWebhook();
-  } else {
-    console.log("[SEND] Texte trop court, annulation");
+    addLog(`❌ Erreur démarrage: ${e.message}`);
     setState(STATE.IDLE);
   }
 }
 
 function forceStop() {
-  clearSilenceTimer();
-  
   if (currentState === STATE.LISTENING) {
     try {
-      recognition.stop();
+      recognition.stop(); // onend sera appelé automatiquement
     } catch (e) {
-      console.error("[STT] Erreur à l'arrêt forcé:", e);
+      addLog(`❌ Erreur arrêt: ${e.message}`);
     }
   }
-  
   setState(STATE.IDLE);
 }
 
@@ -344,19 +296,23 @@ async function sendToWebhook() {
   const text = inputText.value.trim();
   
   if (!text) {
-    console.log("[SEND] Aucun texte à envoyer");
+    addLog("⚠️ Aucun texte à envoyer");
     setState(STATE.IDLE);
     return;
   }
   
-  // Passer en mode PROCESSING (bloque toute autre action)
+  if (text.length < CONFIG.minCharsToSend) {
+    addLog(`⚠️ Texte trop court: ${text.length} caractères`);
+    setState(STATE.IDLE);
+    return;
+  }
+  
   setState(STATE.PROCESSING);
   
   outputText.value = "";
   btnSpeak.disabled = true;
   
-  console.log("[SEND] Envoi au webhook:", text);
-  rawText.value += `\n[${new Date().toLocaleTimeString()}] 📤 "${text}"`;
+  addLog(`📡 Envoi: "${text.substring(0, 50)}..."`);
   
   try {
     const response = await fetch(CONFIG.webhookUrl, {
@@ -365,31 +321,32 @@ async function sendToWebhook() {
       body: JSON.stringify({ chatInput: text })
     });
     
-    const rawResponse = await response.text();
-    rawText.value += `\n[${new Date().toLocaleTimeString()}] 📥 ${rawResponse.substring(0, 100)}...`;
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}`);
+    }
     
-    // Extraction de la réponse
+    const rawResponse = await response.text();
+    addLog(`📥 Réponse brute: ${rawResponse.substring(0, 100)}...`);
+    
     let answer = rawResponse;
     try {
       const parsed = JSON.parse(rawResponse);
       answer = extractOutput(parsed) || rawResponse;
     } catch (e) {
-      console.log("[PARSE] Réponse non-JSON, utilisation brute");
+      addLog("⚠️ Réponse non-JSON, utilisation brute");
     }
     
     outputText.value = answer;
     btnSpeak.disabled = false;
     
-    // Passer en mode SPEAKING et lancer TTS
+    addLog(`✅ Réponse extraite: "${answer.substring(0, 50)}..."`);
+    
     speakResponse(answer);
     
   } catch (error) {
-    console.error("[SEND] Erreur réseau:", error);
-    rawText.value += `\n[${new Date().toLocaleTimeString()}] ❌ Erreur: ${error.message}`;
-    
+    addLog(`❌ Erreur réseau: ${error.message}`);
     setState(STATE.IDLE);
     
-    // Redémarrer automatiquement après une erreur
     if (CONFIG.continuousMode) {
       setTimeout(startListening, 2000);
     }
@@ -412,15 +369,12 @@ function extractOutput(obj) {
 /* ================= SYNTHÈSE VOCALE ================= */
 function speakResponse(text) {
   if (!text) {
-    console.log("[TTS] Pas de texte à lire");
+    addLog("⚠️ Pas de texte à lire");
     setState(STATE.IDLE);
     return;
   }
   
-  // Passer en mode SPEAKING (bloque le micro)
   setState(STATE.SPEAKING);
-  
-  // Annuler toute synthèse en cours
   speechSynthesis.cancel();
   
   const utterance = new SpeechSynthesisUtterance(text);
@@ -429,20 +383,16 @@ function speakResponse(text) {
   utterance.pitch = 1.0;
   
   utterance.onstart = () => {
-    console.log("[TTS] Début lecture");
+    addLog("🔊 Lecture TTS démarrée");
   };
   
   utterance.onend = () => {
-    console.log("[TTS] Fin lecture");
-    
-    // ✅ CRUCIAL: Repasser en IDLE AVANT de redémarrer l'écoute
+    addLog("✅ Lecture TTS terminée");
     setState(STATE.IDLE);
     
-    // Redémarrage de l'écoute avec délai de sécurité
     if (CONFIG.continuousMode) {
-      console.log(`[AUTO] Redémarrage écoute dans ${CONFIG.restartAfterTtsMs}ms`);
+      addLog(`⏳ Redémarrage dans ${CONFIG.restartAfterTtsMs}ms`);
       setTimeout(() => {
-        // Double vérification qu'on est toujours en IDLE
         if (currentState === STATE.IDLE) {
           startListening();
         }
@@ -451,7 +401,7 @@ function speakResponse(text) {
   };
   
   utterance.onerror = (event) => {
-    console.error("[TTS] Erreur:", event.error);
+    addLog(`❌ Erreur TTS: ${event.error}`);
     setState(STATE.IDLE);
     
     if (CONFIG.continuousMode) {
@@ -464,27 +414,27 @@ function speakResponse(text) {
 
 /* ================= BOUTONS UI ================= */
 btnMic.onclick = () => {
-  console.log("[UI] Bouton Démarrer");
+  addLog("🖱️ Clic Démarrer");
   startListening();
 };
 
 btnStop.onclick = () => {
-  console.log("[UI] Bouton Stop");
+  addLog("🖱️ Clic Stop");
   forceStop();
 };
 
 btnSend.onclick = () => {
-  console.log("[UI] Bouton Envoyer");
+  addLog("🖱️ Clic Envoyer manuel");
   sendToWebhook();
 };
 
 btnSpeak.onclick = () => {
-  console.log("[UI] Bouton Relire");
+  addLog("🖱️ Clic Relire");
   speakResponse(outputText.value);
 };
 
 btnClear.onclick = () => {
-  console.log("[UI] Bouton Effacer");
+  addLog("🖱️ Clic Effacer");
   inputText.value = "";
   outputText.value = "";
   rawText.value = "";
@@ -494,10 +444,10 @@ btnClear.onclick = () => {
 
 /* ================= INITIALISATION ================= */
 if (initSpeechRecognition()) {
-  console.log("✅ Jarvis initialisé avec succès");
-  rawText.value = `[${new Date().toLocaleTimeString()}] ✅ Système prêt\n`;
+  addLog("✅ Jarvis initialisé avec succès");
+  addLog("💡 Clique sur 'Démarrer' ou dis quelque chose !");
 } else {
-  console.error("❌ Impossible d'initialiser la reconnaissance vocale");
+  addLog("❌ Impossible d'initialiser");
 }
 </script>
 </body>
